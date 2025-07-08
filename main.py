@@ -1,6 +1,7 @@
 import opendssdirect as dss
 import pandas as pd
 import time
+import os
 
 from IEEE_123_Bus_G_neighbourhoods import *
 
@@ -14,7 +15,9 @@ class OpenDSSCircuit:
     """
 
     def __init__(self, dss_file: str):
-        self.dss_file = dss_file or r"Test_Systems\IEEE_123_Bus-G\Master.dss"
+        # Use POSIX-style path for Linux compatibility
+        default_dss_path = os.path.join("Test_Systems", "IEEE_123_Bus-G", "Master.DSS")
+        self.dss_file = dss_file or default_dss_path
         self.devices = {}
         self.bus_capacities = {}
         self.bus_transformers = {}
@@ -549,7 +552,7 @@ class OpenDSSCircuit:
         target_dfp = next((dfp for dfp in self.dfps if dfp['name'].lower() == dfp_name.lower()), None)
         if not target_dfp:
             return {"status": "error", "message": f"DFP with name '{dfp_name}' not found."}
-        
+
         dfp_index = target_dfp['index']
         num_dfps = len(self.dfps)
 
@@ -583,7 +586,7 @@ class OpenDSSCircuit:
 
         if len(dfp_list) >= dfp_index:
             dfp_list[dfp_index - 1] = 0
-        
+
         return {"status": "success"}
 
     def register_dfp(self, name: str, min_power_kw: float, target_pf: float):
@@ -637,7 +640,7 @@ class OpenDSSCircuit:
         for bus, subscriptions in self.bus_dfps.items():
             if len(subscriptions) > dfp_to_delete_index:
                 subscriptions.pop(dfp_to_delete_index)
-        
+
         print("All bus subscriptions have been re-mapped.")
         return {"status": "success"}
 
@@ -665,19 +668,19 @@ class OpenDSSCircuit:
                 # Update the load in the OpenDSS model
                 load_name = f"dev_{device['device_name'].replace(' ', '_')}"
                 dss.Text.Command(f"edit Load.{load_name} kW={new_kw}")
-                
+
                 # Update the internal state tracking
                 device['kw'] = new_kw
                 total_reduction_kw += reduction_amount
                 modified_count += 1
-        
+
         if total_reduction_kw > 0:
             if bus_name_lower in self.bus_capacities:
                 self.bus_capacities[bus_name_lower]['load_kw'] -= total_reduction_kw
 
         if modified_count > 0:
             return {
-                "status": "success", 
+                "status": "success",
                 "message": f"Modified {modified_count} devices on bus '{bus_name}'. Total load reduced by {total_reduction_kw:.2f} kW."
             }
         else:
@@ -695,7 +698,7 @@ class OpenDSSCircuit:
         target_dfp = next((dfp for dfp in self.dfps if dfp['name'].lower() == dfp_name.lower()), None)
         if not target_dfp:
             return {"status": "error", "message": f"DFP with name '{dfp_name}' not found."}
-        
+
         dfp_index = target_dfp['index']
         # Interpret DFP parameters as per the new requirement
         power_threshold_kw = target_dfp['min_power_kw']
@@ -703,7 +706,7 @@ class OpenDSSCircuit:
 
         # Find all subscribed buses
         subscribed_buses = [
-            bus_name for bus_name, subs in self.bus_dfps.items() 
+            bus_name for bus_name, subs in self.bus_dfps.items()
             if len(subs) >= dfp_index and subs[dfp_index - 1] == 1
         ]
 
@@ -715,13 +718,13 @@ class OpenDSSCircuit:
         for bus_name in subscribed_buses:
             result = self.modify_high_wattage_devices_in_bus(bus_name, power_threshold_kw, reduction_factor)
             execution_log.append(f"Bus '{bus_name}': {result['message']}")
-            
+
         return {
             "status": "success",
             "message": f"Executed DFP '{dfp_name}' on {len(subscribed_buses)} bus(es).",
             "details": execution_log
         }
-    
+
     # --- END NEW FUNCTIONS ---
 
     def get_power_flow_results(self) -> dict:
