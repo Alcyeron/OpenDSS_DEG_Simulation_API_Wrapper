@@ -808,7 +808,7 @@ class OpenDSSCircuit:
         target_dfp = next((dfp for dfp in self.dfps if dfp['name'].lower() == dfp_name.lower()), None)
         if not target_dfp:
             return {"status": "error", "message": f"DFP with name '{dfp_name}' not found."}
-        
+
         dfp_index = target_dfp['index']
         num_dfps = len(self.dfps)
 
@@ -839,7 +839,7 @@ class OpenDSSCircuit:
 
         if len(dfp_list) >= dfp_index:
             dfp_list[dfp_index - 1] = 0
-        
+
         return {"status": "success"}
 
     def register_dfp(self, name: str, min_power_kw: float, target_pf: float):
@@ -890,7 +890,7 @@ class OpenDSSCircuit:
         for bus, subscriptions in self.bus_dfps.items():
             if len(subscriptions) > dfp_to_delete_index:
                 subscriptions.pop(dfp_to_delete_index)
-        
+
         print("All bus subscriptions have been re-mapped.")
         return {"status": "success"}
 
@@ -919,14 +919,14 @@ class OpenDSSCircuit:
                 device['kw'] = new_kw
                 total_reduction_kw += reduction_amount
                 modified_count += 1
-        
+
         if total_reduction_kw > 0:
             if bus_name_lower in self.bus_capacities:
                 self.bus_capacities[bus_name_lower]['load_kw'] -= total_reduction_kw
 
         if modified_count > 0:
             return {
-                "status": "success", 
+                "status": "success",
                 "message": f"Modified {modified_count} devices on bus '{bus_name}'. Total load reduced by {total_reduction_kw:.2f} kW."
             }
         else:
@@ -944,13 +944,13 @@ class OpenDSSCircuit:
         target_dfp = next((dfp for dfp in self.dfps if dfp['name'].lower() == dfp_name.lower()), None)
         if not target_dfp:
             return {"status": "error", "message": f"DFP with name '{dfp_name}' not found."}
-        
+
         dfp_index = target_dfp['index']
         power_threshold_kw = target_dfp['min_power_kw']
         reduction_factor = target_dfp['target_pf']
 
         subscribed_buses = [
-            bus_name for bus_name, subs in self.bus_dfps.items() 
+            bus_name for bus_name, subs in self.bus_dfps.items()
             if len(subs) >= dfp_index and subs[dfp_index - 1] == 1
         ]
 
