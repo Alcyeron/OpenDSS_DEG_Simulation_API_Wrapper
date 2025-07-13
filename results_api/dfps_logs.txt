@@ -1,0 +1,8 @@
+[2025-07-13 23:06:23] CREATED: DFP 'Peak Power Shaving 2' registered with details: {'index': 1, 'name': 'Peak Power Shaving 2', 'description': 'Sample Description', 'min_power_kw': 40.0, 'target_pf': 0.8, 'registered_at': '2025-07-13 23:06:23'}.
+[2025-07-13 23:07:22] SUBSCRIBED: Bus '149' to DFP 'Peak Power Shaving 2'.
+[2025-07-13 23:12:31] CREATED: DFP 'Peak Power Shaving 1' registered with details: {'index': 2, 'name': 'Peak Power Shaving 1', 'description': 'Sample Description', 'min_power_kw': 40.0, 'target_pf': 0.8, 'registered_at': '2025-07-13 23:12:31'}.
+[2025-07-13 23:32:05] SENT_TO_NEIGHBOURHOOD: Sent DFP 'Peak Power Shaving 2' to neighbourhood 1. Subscribed 5 out of 11 valid buses.
+[2025-07-13 23:34:53] MODIFIED: DFP 'Peak Power Shaving 1' updated. New details: {'index': 2, 'name': 'Peak Power Shaving 1', 'description': 'Sample Description', 'min_power_kw': 12.0, 'target_pf': 0.8, 'registered_at': '2025-07-13 23:12:31'}.
+[2025-07-13 23:38:40] EXECUTION: DFP 'Peak Power Shaving 2' was run. Details: ["Bus '149': Chose not to participate", "Bus '197': No devices found on bus '197'.", "Bus '3': Chose not to participate", "Bus '5': Chose not to participate", "Bus '4': No devices found on bus '4'."]
+[2025-07-13 23:41:41] DELETED: DFP 'Peak Power Shaving 2'.
+[2025-07-14 11:27:51] CREATED: DFP 'Reduce load by 10%' registered with details: {'index': 1, 'name': 'Reduce load by 10%', 'description': 'Reduce load by 10%', 'min_power_kw': 10.0, 'target_pf': 0.6, 'registered_at': '2025-07-14 11:27:51'}.
