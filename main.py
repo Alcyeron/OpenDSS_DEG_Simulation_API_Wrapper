@@ -6,8 +6,10 @@ import os
 
 from IEEE_123_Bus_G_neighbourhoods import *
 
+
 # This factor makes generation curtailment more aggressive to stabilize the system faster.
 AGGRESSION_FACTOR = 1.25
+CRITICAL_API_ENDPOINT = "http://localhost:3000/api/critical"
 
 class OpenDSSCircuit:
     """
@@ -17,10 +19,15 @@ class OpenDSSCircuit:
 
     def __init__(self, dss_file: str):
         if dss_file:
-            self.dss_file = dss_file
+            # Convert the provided path to an absolute path
+            self.dss_file = os.path.abspath(dss_file)
         else:
-            self.dss_file = os.path.join('Test_Systems', 'IEEE_123_Bus-G', 'Master.dss')
-            
+            default_dss_path = os.path.join("Test_Systems", "IEEE_123_Bus-G", "Master.DSS")
+            self.dss_file = default_dss_path
+
+
+        self.transformer_data = TRANSFORMER_DATA
+        self.neighborhood_data = NEIGHBORHOOD_DATA
         self.devices = {}
         self.storage_devices = {}
         self.last_simulation_time = time.time()
@@ -33,6 +40,8 @@ class OpenDSSCircuit:
         self.bus_dfps = {} # Tracks bus-level subscriptions
         self.dfps = [] # Initializes the list to store DFP program definitions
         self.dfp_acceptance_status = {} # Tracks last acceptance status for (bus, dfp_name)
+        self.bus_coords = {}
+        self.dynamic_commands = []
         self._initialize_dss()
 
     def _initialize_dss(self):
@@ -46,6 +55,7 @@ class OpenDSSCircuit:
         self._inventory_capacities_and_map_loads()
         self._add_neighborhood_transformers_and_rewire_loads()
 
+
     def _inventory_capacities_and_map_loads(self):
         """
         Scans all loads and generators on the original circuit to populate the
@@ -56,6 +66,11 @@ class OpenDSSCircuit:
         self.load_original_bus_map = {}
         self.original_load_kws = {}
         self.generator_states = {}
+
+        # Store bus coordinates from the simulation file
+        for bus_name in dss.Circuit.AllBusNames():
+            dss.Circuit.SetActiveBus(bus_name)
+            self.bus_coords[bus_name.lower()] = {'X': dss.Bus.X(), 'Y': dss.Bus.Y()}
 
         if dss.Loads.Count() > 0:
             dss.Loads.First()
@@ -89,18 +104,19 @@ class OpenDSSCircuit:
                 if not dss.Generators.Next() > 0: break
         print("Initial bus capacities inventoried.")
 
+
     def _add_neighborhood_transformers_and_rewire_loads(self):
         """
         Adds transformers and rewires existing loads to be served by them.
         """
         print("Adding neighborhood transformers and rewiring loads...")
 
-        for neighborhood_id, primary_bus_name in TRANSFORMER_DATA.items():
+        for neighborhood_id, primary_bus_name in self.transformer_data.items():
             transformer_name = f"xfmr_neigh_{neighborhood_id}"
             primary_bus = primary_bus_name.lower()
             secondary_bus = f"{primary_bus}_sec"
 
-            buses_in_neighborhood = [b.lower() for b in NEIGHBORHOOD_DATA.get(neighborhood_id, [])]
+            buses_in_neighborhood = [b.lower() for b in self.neighborhood_data.get(neighborhood_id, [])]
 
             if primary_bus not in [b.lower() for b in dss.Circuit.AllBusNames()]:
                 continue
@@ -122,6 +138,197 @@ class OpenDSSCircuit:
                     dss.Text.Command(f"edit Load.{load_name} Bus1={secondary_bus} kV=0.24")
 
         print(f"Transformer and rewiring setup complete.")
+
+
+# In main.py, REPLACE the old add_node method with this one.
+    def add_node(self, new_bus_name: str, neighborhood_id: int, coordinates: dict, connections: list, load_kw: float, load_kvar: float) -> dict:
+        """
+        Adds a new physical node (bus) to the simulation, connecting it to existing buses with new lines.
+        """
+        new_bus_name_lower = new_bus_name.lower()
+
+        # --- Validation ---
+        if new_bus_name_lower in self.bus_coords:
+            return {"status": "error", "message": f"Bus '{new_bus_name}' already exists."}
+        if neighborhood_id not in self.neighborhood_data:
+            return {"status": "error", "message": f"Neighborhood ID '{neighborhood_id}' not found."}
+        if not connections:
+            return {"status": "error", "message": "At least one connection to an existing bus is required."}
+
+        # --- Get all available linecodes for robust validation ---
+        dss.LineCodes.First()
+        available_linecodes = []
+        while True:
+            name = dss.LineCodes.Name()
+            if not name: break
+            available_linecodes.append(name)
+            if not dss.LineCodes.Next() > 0: break
+
+        # --- Create Physical Line Connections ---
+        # This will implicitly create the new bus with the correct number of phases based on the linecodes.
+        for conn in connections:
+            try:
+                to_bus = conn['to_bus'].lower()
+                linecode = conn['linecode']
+                length = conn['length']
+
+                # More robust check against the list of available linecodes
+                if linecode not in available_linecodes:
+                    return {
+                        "status": "error",
+                        "message": f"LineCode '{linecode}' not found.",
+                        "available_linecodes": available_linecodes
+                    }
+
+                # Set the active linecode to get its properties
+                dss.LineCodes.Name(linecode)
+                line_phases = dss.LineCodes.Phases()
+
+                line_name = f"L_{new_bus_name_lower}_{to_bus}"
+
+                # This command now correctly defines the new bus's topology before any loads are added.
+                cmd = f"New Line.{line_name} Bus1={new_bus_name_lower} Bus2={to_bus} LineCode={linecode} Length={length} Phases={line_phases}"
+                dss.Text.Command(cmd)
+                self.dynamic_commands.append(cmd)
+
+            except KeyError as e:
+                return {"status": "error", "message": f"Missing required connection parameter: {e}"}
+            except Exception as e:
+                return {"status": "error", "message": f"OpenDSS error creating line to '{to_bus}': {e}"}
+
+        # --- Add Load to the New Bus ---
+        # Now that the bus is created with the correct topology, we can safely add the load.
+        try:
+            # Get the voltage from an existing connection point to correctly define the load's kV rating.
+            first_connection_bus = connections[0]['to_bus'].lower()
+            dss.Circuit.SetActiveBus(first_connection_bus)
+            bus_kv_ll = dss.Bus.kVBase() # This is the Line-to-Line voltage
+
+            # For a Wye-connected load, we need the Line-to-Neutral voltage.
+            load_kv_ln = bus_kv_ll / (3**0.5) if dss.Bus.NumNodes() > 1 else bus_kv_ll
+
+            new_load_name = f"load_{new_bus_name_lower}"
+            # Attach the single-phase load to the first phase (.1) of the new bus.
+            cmd = f"New Load.{new_load_name} Bus1={new_bus_name_lower}.1 phases=1 conn=wye kV={load_kv_ln:.4f} kW={load_kw} kVar={load_kvar} model=1"
+            dss.Text.Command(cmd)
+            self.dynamic_commands.append(cmd)
+        except Exception as e:
+            return {"status": "error", "message": f"OpenDSS error creating load on new bus: {e}"}
+
+
+        # --- Update Internal Tracking Data Structures ---
+        self.neighborhood_data[neighborhood_id].append(new_bus_name_lower)
+        self.bus_coords[new_bus_name_lower] = coordinates
+        self.bus_capacities[new_bus_name_lower] = {'load_kw': load_kw, 'gen_kw': 0}
+        self.load_original_bus_map[new_load_name.lower()] = new_bus_name_lower
+        self.original_load_kws[new_load_name.lower()] = load_kw
+
+        message = f"Successfully added physical node '{new_bus_name}' with {len(connections)} connections."
+        print(message)
+        return {"status": "success", "message": message}
+
+
+    def modify_node(self, bus_name: str, load_kw: float = None, load_kvar: float = None) -> dict:
+        """
+        Modifies the parameters of a dynamically added node, specifically its load.
+        """
+        bus_name_lower = bus_name.lower()
+        load_name = f"load_{bus_name_lower}"
+
+        # --- Validation ---
+        if bus_name_lower not in self.bus_coords:
+            return {"status": "error", "message": f"Bus '{bus_name}' not found."}
+
+        dss.Loads.Name(load_name)
+        if dss.Loads.Name().lower() != load_name:
+            return {"status": "error", "message": f"Load '{load_name}' associated with bus '{bus_name}' not found. Cannot modify."}
+
+        if load_kw is None and load_kvar is None:
+            return {"status": "info", "message": "No parameters provided to modify."}
+
+        # --- Build and Execute Command ---
+        try:
+            edit_command_parts = [f"edit Load.{load_name}"]
+
+            # Get the current values to calculate the delta for capacity tracking
+            current_kw = dss.Loads.kW()
+
+            if load_kw is not None:
+                edit_command_parts.append(f"kW={load_kw}")
+                new_kw = load_kw
+            else:
+                new_kw = current_kw
+
+            if load_kvar is not None:
+                edit_command_parts.append(f"kVar={load_kvar}")
+
+            dss.Text.Command(" ".join(edit_command_parts))
+
+            # --- Update Internal Tracking ---
+            kw_delta = new_kw - current_kw
+            self.bus_capacities[bus_name_lower]['load_kw'] += kw_delta
+            self.original_load_kws[load_name.lower()] += kw_delta
+
+            message = f"Successfully modified node '{bus_name}'."
+            print(message)
+            return {"status": "success", "message": message}
+
+        except Exception as e:
+            return {"status": "error", "message": f"OpenDSS error modifying load on '{bus_name}': {e}"}
+
+
+    def delete_node(self, bus_name: str) -> dict:
+        """
+        Deletes a dynamically added node and its connections from the simulation.
+        """
+        bus_name_lower = bus_name.lower()
+        load_name = f"load_{bus_name_lower}"
+
+        # --- Validation ---
+        if bus_name_lower not in self.bus_coords:
+            return {"status": "error", "message": f"Bus '{bus_name}' not found."}
+
+        dss.Loads.Name(load_name)
+        if dss.Loads.Name().lower() != load_name:
+            return {"status": "error", "message": f"Bus '{bus_name}' does not appear to be a dynamically added node. Deletion aborted for safety."}
+
+        # --- Disable All Associated Elements ---
+        try:
+            # Disable the load
+            dss.Text.Command(f"disable Load.{load_name}")
+
+            # Disable all lines connected to this bus
+            disabled_lines = []
+            for line_name in dss.Lines.AllNames():
+                dss.Lines.Name(line_name)
+                # A line is connected if its name contains the bus name in either Bus1 or Bus2 part
+                if f"_{bus_name_lower}_" in line_name or line_name.startswith(f"l_{bus_name_lower}_"):
+                     dss.Text.Command(f"disable Line.{line_name}")
+                     disabled_lines.append(line_name)
+
+        except Exception as e:
+            return {"status": "error", "message": f"OpenDSS error disabling elements for bus '{bus_name}': {e}"}
+
+        # --- Update Internal Tracking Data Structures ---
+        kw_to_remove = self.original_load_kws.pop(load_name.lower(), 0)
+        self.bus_capacities[bus_name_lower]['load_kw'] -= kw_to_remove
+        if self.bus_capacities[bus_name_lower]['load_kw'] <= 0 and self.bus_capacities[bus_name_lower]['gen_kw'] <= 0:
+            del self.bus_capacities[bus_name_lower]
+
+        del self.bus_coords[bus_name_lower]
+        del self.load_original_bus_map[load_name.lower()]
+        if bus_name_lower in self.bus_dfps:
+            del self.bus_dfps[bus_name_lower]
+
+        # Remove the bus from its neighborhood list
+        for nid, bus_list in self.neighborhood_data.items():
+            if bus_name_lower in bus_list:
+                self.neighborhood_data[nid].remove(bus_name_lower)
+                break
+
+        message = f"Successfully deleted node '{bus_name}' and disabled {len(disabled_lines)} connected line(s)."
+        print(message)
+        return {"status": "success", "message": message}
 
     def _check_transformer_overloads(self) -> list:
         """Checks all transformers for overloading and returns a list of overloaded ones."""
@@ -175,9 +382,19 @@ class OpenDSSCircuit:
             powers = dss.CktElement.Powers()
             current_kva = (powers[0]**2 + powers[1]**2)**0.5
             loading_percent = (current_kva / rated_kva) * 100 if rated_kva > 0 else 0
+
+            # Determine the transformer's status based on its loading percentage
+            status = "OK"
+            if loading_percent > 100:
+                status = "Overloaded"
+            elif loading_percent > 90:
+                status = "Critical"
+            elif loading_percent > 80:
+                status = "Warning"
+
             self.transformer_statuses[name] = {
                 "name": name, "rated_kVA": rated_kva, "current_kVA": round(current_kva, 2),
-                "loading_percent": round(loading_percent, 2), "status": "Overloaded" if loading_percent > 100 else "OK"
+                "loading_percent": round(loading_percent, 2), "status": status
             }
             if not dss.Transformers.Next() > 0: break
 
@@ -227,7 +444,7 @@ class OpenDSSCircuit:
                 if device['current_energy_kwh'] >= device['max_capacity_kwh']:
                     device['current_energy_kwh'] = device['max_capacity_kwh']
                     print(f"Storage device '{name}' is full. Stopping charge.")
-                    
+
                     dss.Text.Command(f"edit Load.{device['opendss_load_name']} kW=0")
                     self.bus_capacities[device['bus_name']]['load_kw'] -= device['actual_charge_rate']
                     device['actual_charge_rate'] = 0
@@ -236,7 +453,7 @@ class OpenDSSCircuit:
             elif device['mode'] == 'generator':
                 energy_removed = device['actual_discharge_rate'] * delta_t_hours
                 device['current_energy_kwh'] -= energy_removed
-                
+
                 if device['current_energy_kwh'] <= 0:
                     device['current_energy_kwh'] = 0
                     print(f"Storage device '{name}' fully discharged. Stopping discharge.")
@@ -302,8 +519,8 @@ class OpenDSSCircuit:
 
         exporting_neighborhoods = {}
         total_system_net_export = 0
-        for hood_id in NEIGHBORHOOD_DATA.keys():
-            buses_in_hood = [b.lower() for b in NEIGHBORHOOD_DATA.get(hood_id, [])]
+        for hood_id in self.neighborhood_data.keys():
+            buses_in_hood = [b.lower() for b in self.neighborhood_data.get(hood_id, [])]
             total_load = sum(self.bus_capacities.get(b, {}).get('load_kw', 0) for b in buses_in_hood)
             total_gen = sum(self.bus_capacities.get(b, {}).get('gen_kw', 0) for b in buses_in_hood)
             net_power = total_gen - total_load
@@ -353,7 +570,7 @@ class OpenDSSCircuit:
 
     def _reduce_neighborhood_load_by_amount(self, neighborhood_id: int, reduction_kw: float):
         """Reduces the load on net-importing buses within a neighborhood by a specific total amount, prioritizing storage."""
-        buses_in_neighborhood = [b.lower() for b in NEIGHBORHOOD_DATA.get(neighborhood_id, [])]
+        buses_in_neighborhood = [b.lower() for b in self.neighborhood_data.get(neighborhood_id, [])]
 
         importing_buses_in_hood = {}
         total_net_import = 0
@@ -372,9 +589,9 @@ class OpenDSSCircuit:
         for bus_name, net_import_on_bus in importing_buses_in_hood.items():
             proportion_of_import = net_import_on_bus / total_net_import
             kw_to_shed_from_bus = reduction_kw * proportion_of_import
-            
+
             if kw_to_shed_from_bus <= 0: continue
-            
+
             remaining_shed = kw_to_shed_from_bus
 
             # --- Stage 1: Reduce load from charging storage devices first ---
@@ -384,10 +601,10 @@ class OpenDSSCircuit:
             ]
             for device in active_storage_loads:
                 if remaining_shed <= 0: break
-                
+
                 current_kw = device['actual_charge_rate']
                 reduction = min(remaining_shed, current_kw)
-                
+
                 # Update the device's actual rate and the OpenDSS element
                 device['actual_charge_rate'] -= reduction
                 dss.Text.Command(f"edit Load.{device['opendss_load_name']} kW={device['actual_charge_rate']}")
@@ -396,7 +613,7 @@ class OpenDSSCircuit:
             # --- Stage 2: If more shedding is needed, reduce other loads ---
             if remaining_shed > 0:
                 regular_loads = {
-                    ln: self.original_load_kws[ln] for ln, ob in self.load_original_bus_map.items() 
+                    ln: self.original_load_kws[ln] for ln, ob in self.load_original_bus_map.items()
                     if ob == bus_name and not ln.startswith('stor_load_')
                 }
                 total_regular_load_kw = sum(regular_loads.values())
@@ -418,7 +635,7 @@ class OpenDSSCircuit:
 
     def _curtail_neighborhood_generation_by_amount(self, neighborhood_id: int, reduction_kw: float):
         """Reduces generation on net-exporting buses within a neighborhood by a specific total amount, prioritizing storage."""
-        buses_in_neighborhood = [b.lower() for b in NEIGHBORHOOD_DATA.get(neighborhood_id, [])]
+        buses_in_neighborhood = [b.lower() for b in self.neighborhood_data.get(neighborhood_id, [])]
 
         exporting_buses = {}
         total_net_export_in_hood = 0
@@ -443,7 +660,7 @@ class OpenDSSCircuit:
             floor_gen_kw = load_on_bus
             final_gen_kw_for_bus = max(floor_gen_kw, new_target_gen_for_bus)
             total_reduction_for_bus = current_gen_on_bus - final_gen_kw_for_bus
-            
+
             if total_reduction_for_bus <= 0: continue
             remaining_reduction = total_reduction_for_bus
 
@@ -482,14 +699,44 @@ class OpenDSSCircuit:
             if actual_reduction_amount > 0:
                 self.bus_capacities[bus_name]['gen_kw'] -= actual_reduction_amount
 
-    def modify_loads_in_neighborhood(self, neighborhood_id: int, factor: float):
-        """Modifies loads in a neighborhood, only affecting the net load on each importing bus."""
-        buses_in_neighborhood = [b.lower() for b in NEIGHBORHOOD_DATA.get(neighborhood_id, [])]
+    def modify_loads_in_neighborhood(self, neighborhood_id: int, factor: float) -> dict:
+        """Modifies loads in a neighborhood and returns a summary of the changes."""
+        buses_in_neighborhood = [b.lower() for b in self.neighborhood_data.get(neighborhood_id, [])]
+        if not buses_in_neighborhood:
+            return {"status": "not_found", "message": f"Neighborhood {neighborhood_id} not found or is empty."}
+
+        modified_buses = []
+        unmodified_buses = []
+        total_reduction_kw = 0
+
         for bus_name in buses_in_neighborhood:
-            self.modify_loads_in_houses(bus_name, factor)
+            result = self.modify_loads_in_houses(bus_name, factor)
+            if result.get("status") == "success":
+                reduction = result.get("load_reduction_kw", 0)
+                total_reduction_kw += reduction
+                modified_buses.append({"bus_name": bus_name, "load_reduction_kw": reduction})
+            else:
+                unmodified_buses.append({"bus_name": bus_name, "reason": result.get("message")})
+
+        if not modified_buses:
+             message = f"No loads were modified in neighborhood {neighborhood_id}."
+        else:
+             message = f"Attempted to modify loads in neighborhood {neighborhood_id} with factor {factor}."
+
+        return {
+            "status": "success",
+            "message": message,
+            "details": {
+                "modified_bus_count": len(modified_buses),
+                "unmodified_bus_count": len(unmodified_buses),
+                "total_load_reduction_kw": round(total_reduction_kw, 2),
+                "modified_buses": modified_buses,
+                "unmodified_buses": unmodified_buses
+            }
+        }
 
     def modify_loads_in_houses(self, house_bus_name: str, factor: float, is_auto_reduction: bool = False) -> dict:
-        """Modifies the load on a single bus. If not an auto_reduction, it only affects the net load."""
+        """Modifies the load on a single bus and returns details of the change."""
         bus_name_lower = house_bus_name.lower()
         bus_cap = self.bus_capacities.get(bus_name_lower)
         if not bus_cap or bus_cap['load_kw'] == 0:
@@ -521,7 +768,7 @@ class OpenDSSCircuit:
                 dss.Text.Command(f"edit Load.{load_name} kW={new_kw}")
 
         self.bus_capacities[bus_name_lower]['load_kw'] -= reduction_amount
-        return {"status": "success", "message": "Load modified."}
+        return {"status": "success", "message": f"Load modified on bus {house_bus_name}.", "load_reduction_kw": round(reduction_amount, 2)}
 
     def get_buses_with_loads(self) -> pd.DataFrame:
         """Gets all buses with voltage info, power info from the logical model, and connected elements."""
@@ -560,7 +807,7 @@ class OpenDSSCircuit:
 
         buses_df = pd.DataFrame(bus_data)
         device_map = {bus: self.devices.get(bus, []) for bus in all_bus_names}
-        
+
         storage_map = {bus: [] for bus in all_bus_names}
         for name, details in self.storage_devices.items():
             bus = details['bus_name']
@@ -591,15 +838,82 @@ class OpenDSSCircuit:
 
         return buses_df
 
-    def add_device_to_bus(self, bus_name: str, device_name: str, kw: float, phases: int):
-        """Adds a new load (device) to the correct transformer secondary bus."""
+
+    def get_single_bus_details(self, bus_name: str) -> dict:
+        """Gets detailed information for a single bus."""
+        bus_name_lower = bus_name.lower()
+        all_bus_names = [b.lower() for b in dss.Circuit.AllBusNames()]
+
+        if bus_name_lower not in all_bus_names:
+            return {} # Return empty dict if bus not found
+
+        dss.Circuit.SetActiveBus(bus_name_lower)
+        nodes_on_bus = dss.Bus.Nodes()
+        if not nodes_on_bus:
+            return {} # Return empty if no nodes on bus
+
+        pu_voltages = dss.Bus.puVmagAngle()
+        x_coord = dss.Bus.X()
+        y_coord = dss.Bus.Y()
+
+        caps = self.bus_capacities.get(bus_name_lower, {'load_kw': 0, 'gen_kw': 0})
+        total_load_kw = caps['load_kw']
+        total_gen_kw = caps['gen_kw']
+        net_power_kw = total_gen_kw - total_load_kw
+
+        num_dfps = len(self.dfps)
+        dfps_list = self.bus_dfps.setdefault(bus_name_lower, [0] * num_dfps)
+        if len(dfps_list) != num_dfps:
+            dfps_list = (dfps_list + [0] * num_dfps)[:num_dfps]
+            self.bus_dfps[bus_name_lower] = dfps_list
+
+        bus_data = {
+            'Bus': bus_name_lower,
+            'Coordinates': {'X': x_coord, 'Y': y_coord},
+            'DFPs': dfps_list,
+            'VMag_pu': pu_voltages[0],
+            'VAngle': pu_voltages[1],
+            'Load_kW': total_load_kw,
+            'Gen_kW': total_gen_kw,
+            'Net_Power_kW': net_power_kw
+        }
+
+        # Get devices
+        bus_data['Devices'] = self.devices.get(bus_name_lower, [])
+
+        # Get storage devices
+        storage_list = []
+        for name, details in self.storage_devices.items():
+            if details['bus_name'] == bus_name_lower:
+                storage_list.append({
+                    'device_name': name,
+                    'mode': details['mode'],
+                    'current_energy_kwh': round(details['current_energy_kwh'], 2),
+                    'max_capacity_kwh': details['max_capacity_kwh'],
+                    'build_charge_rate': details['build_charge_rate'],
+                    'build_discharge_rate': details['build_discharge_rate'],
+                    'actual_charge_rate': details.get('actual_charge_rate', 0),
+                    'actual_discharge_rate': details.get('actual_discharge_rate', 0)
+                })
+        bus_data['StorageDevices'] = storage_list
+
+        # Get transformers
+        transformer_names = self.bus_transformers.get(bus_name_lower, [])
+        bus_data['Transformers'] = [self.transformer_statuses.get(name) for name in transformer_names if self.transformer_statuses.get(name)]
+
+        return bus_data
+
+    def add_device_to_bus(self, bus_name: str, device_name: str, kw: float, phases: int) -> dict:
+        """Adds a new load (device) to the correct transformer secondary bus and returns confirmation."""
         primary_bus_lower = bus_name.lower()
 
-        neighborhood_id = next((nid for nid, buses in NEIGHBORHOOD_DATA.items() if primary_bus_lower in [b.lower() for b in buses]), None)
-        if neighborhood_id is None: return
+        neighborhood_id = next((nid for nid, buses in self.neighborhood_data.items() if primary_bus_lower in [b.lower() for b in buses]), None)
+        if neighborhood_id is None:
+            return {"status": "error", "message": f"Bus '{primary_bus_lower}' not found in any known neighborhood."}
 
-        transformer_primary_bus = TRANSFORMER_DATA.get(neighborhood_id)
-        if not transformer_primary_bus: return
+        transformer_primary_bus = self.transformer_data.get(neighborhood_id)
+        if not transformer_primary_bus:
+            return {"status": "error", "message": f"No transformer mapping for neighborhood {neighborhood_id}."}
         secondary_bus = f"{transformer_primary_bus.lower()}_sec"
 
         if primary_bus_lower not in self.bus_capacities:
@@ -616,13 +930,25 @@ class OpenDSSCircuit:
         self.load_original_bus_map[new_load_name_lower] = primary_bus_lower
         self.original_load_kws[new_load_name_lower] = kw
 
-    def disconnect_device_from_bus(self, bus_name: str, device_name: str) -> bool:
-        """Removes a device from the simulation and updates capacity tracking."""
+        return {
+            "status": "success",
+            "message": f"Device '{device_name}' ({kw} kW) added to bus '{bus_name}'.",
+            "details": {
+                "opendss_load_name": new_load_name,
+                "device_name": device_name,
+                "bus_name": bus_name,
+                "kw": kw
+            }
+        }
+
+    def disconnect_device_from_bus(self, bus_name: str, device_name: str) -> dict:
+        """Removes a device from the simulation and returns a confirmation."""
         primary_bus_lower = bus_name.lower()
 
         device_list = self.devices.get(primary_bus_lower, [])
         device_to_remove = next((d for d in device_list if d.get('device_name') == device_name), None)
-        if not device_to_remove: return False
+        if not device_to_remove:
+            return {"status": "not_found", "message": f"Device '{device_name}' not found on bus '{bus_name}'."}
 
         kw_to_subtract = device_to_remove.get('kw', 0)
 
@@ -642,20 +968,46 @@ class OpenDSSCircuit:
         if load_name_to_remove_lower in self.original_load_kws:
             del self.original_load_kws[load_name_to_remove_lower]
 
-        return True
+        return {
+            "status": "success",
+            "message": f"Device '{device_name}' disconnected from bus '{bus_name}'.",
+            "details": {
+                "device_name": device_name,
+                "bus_name": bus_name,
+                "kw_removed": kw_to_subtract
+            }
+        }
 
-    def add_generation_to_bus(self, bus_name: str, kw: float, phases: int):
-        """Adds a new generator and updates capacity tracking."""
-        print(f"Adding {kw}kW generator to bus {bus_name}.")
-
+    def add_generation_to_bus(self, bus_name: str, kw: float, phases: int) -> dict:
+        """Adds a new generator and returns a confirmation message."""
         bus_name_lower = bus_name.lower()
         gen_name = f"Gen_{bus_name_lower.replace('.', '_')}_{kw:.0f}kW"
-        dss.Circuit.SetActiveBus(bus_name_lower)
-        base_kv = dss.Bus.kVBase()
-        if base_kv == 0: return
 
-        conn, final_kv = (".1.2.3", base_kv) if phases == 3 else (f".{dss.Bus.Nodes()[0]}", base_kv / 1.732)
-        dss.Text.Command(f'New Generator.{gen_name} Bus1={bus_name_lower}{conn} phases={phases} kV={final_kv:.4f} kW={kw} PF=1.0')
+        dss.Circuit.SetActiveBus(bus_name_lower)
+        if dss.Circuit.SetActiveBus(bus_name_lower) == 0:
+             return {"status": "error", "message": f"Bus '{bus_name}' not found in the circuit."}
+
+        base_kv = dss.Bus.kVBase()
+        if base_kv == 0:
+            return {"status": "error", "message": f"Bus '{bus_name}' has a base kV of 0. Cannot add generator."}
+
+        nodes = dss.Bus.Nodes()
+        if not nodes:
+            return {"status": "error", "message": f"Bus '{bus_name}' has no nodes."}
+
+        conn = ".1.2.3" if phases == 3 else f".{nodes[0]}"
+        final_kv = base_kv if phases == 3 else base_kv / (3**0.5)
+        
+        # --- Start of Change ---
+        # Create the command string first
+        cmd = f'New Generator.{gen_name} Bus1={bus_name_lower}{conn} phases={phases} kV={final_kv:.4f} kW={kw} PF=1.0'
+        
+        # Execute the command
+        dss.Text.Command(cmd)
+
+        # Append the command to the dynamic commands list to be saved in the cache
+        self.dynamic_commands.append(cmd)
+        # --- End of Change ---
 
         if bus_name_lower not in self.bus_capacities:
             self.bus_capacities[bus_name_lower] = {'load_kw': 0, 'gen_kw': 0}
@@ -666,38 +1018,49 @@ class OpenDSSCircuit:
             'bus_name': bus_name_lower,
         }
 
-    def add_storage_device(self, bus_name: str, device_name: str, max_capacity_kwh: float, charge_rate_kw: float, discharge_rate_kw: float):
-        """Adds a new storage device to the grid with separate charge/discharge rates."""
+        return {
+            "status": "success",
+            "message": f"Generator '{gen_name}' of {kw} kW added to bus '{bus_name}'.",
+            "details": {
+                "generator_name": gen_name,
+                "bus_name": bus_name,
+                "kw": kw,
+                "phases": phases
+            }
+        }
+
+    def add_storage_device(self, bus_name: str, device_name: str, max_capacity_kwh: float, charge_rate_kw: float, discharge_rate_kw: float) -> dict:
+        """Adds a new storage device to the grid and returns a confirmation."""
         primary_bus_lower = bus_name.lower()
         device_name_lower = device_name.lower().replace(' ', '_')
 
-        neighborhood_id = next((nid for nid, buses in NEIGHBORHOOD_DATA.items() if primary_bus_lower in [b.lower() for b in buses]), None)
+        neighborhood_id = next((nid for nid, buses in self.neighborhood_data.items() if primary_bus_lower in [b.lower() for b in buses]), None)
         if neighborhood_id is None:
-            print(f"Error: Bus '{bus_name}' not found in any neighborhood.")
-            return
-        transformer_primary_bus = TRANSFORMER_DATA.get(neighborhood_id)
+            return {"status": "error", "message": f"Bus '{bus_name}' not found in any neighborhood."}
+
+        transformer_primary_bus = self.transformer_data.get(neighborhood_id)
         if not transformer_primary_bus:
-            print(f"Error: No transformer mapping for neighborhood {neighborhood_id}.")
-            return
+            return {"status": "error", "message": f"No transformer mapping for neighborhood {neighborhood_id}."}
         secondary_bus = f"{transformer_primary_bus.lower()}_sec"
 
         load_name = f"stor_load_{device_name_lower}"
         gen_name = f"stor_gen_{device_name_lower}"
 
-        self.storage_devices[device_name_lower] = {
+        device_details = {
             'bus_name': primary_bus_lower,
             'max_capacity_kwh': max_capacity_kwh,
             'current_energy_kwh': 0.0,
             'build_charge_rate': charge_rate_kw,
             'build_discharge_rate': discharge_rate_kw,
-            'actual_charge_rate': charge_rate_kw, # Starts at build rate
-            'actual_discharge_rate': 0, # Starts inactive
+            'actual_charge_rate': charge_rate_kw,
+            'actual_discharge_rate': 0,
             'mode': 'load',
             'active': True,
             'last_update_time': time.time(),
             'opendss_load_name': load_name,
             'opendss_gen_name': gen_name,
         }
+        self.storage_devices[device_name_lower] = device_details
 
         dss.Text.Command(f"New Load.{load_name} Bus1={secondary_bus} phases=1 conn=wye kV=0.24 kW={charge_rate_kw} model=1")
         dss.Text.Command(f"New Generator.{gen_name} Bus1={secondary_bus} phases=1 kV=0.24 kW={discharge_rate_kw} PF=1.0 enabled=no")
@@ -705,8 +1068,14 @@ class OpenDSSCircuit:
         if primary_bus_lower not in self.bus_capacities:
             self.bus_capacities[primary_bus_lower] = {'load_kw': 0, 'gen_kw': 0}
         self.bus_capacities[primary_bus_lower]['load_kw'] += charge_rate_kw
-        
-        print(f"Storage device '{device_name}' added to bus '{bus_name}' in load mode.")
+
+        message = f"Storage device '{device_name}' added to bus '{bus_name}' in load mode."
+        return {
+            "status": "success",
+            "message": message,
+            "details": device_details
+        }
+
 
     def _disconnect_storage_device(self, device_name: str) -> dict:
         """NEW: Disconnects a storage device entirely from the simulation."""
@@ -767,14 +1136,14 @@ class OpenDSSCircuit:
         if device['mode'] == 'load':
             if device['current_energy_kwh'] <= 0:
                 return {"status": "error", "message": f"Cannot switch to generator mode: Storage device '{device_name}' has no energy."}
-            
+
             dss.Text.Command(f"edit Load.{load_name} enabled=no")
             if is_active:
                 self.bus_capacities[bus_name]['load_kw'] -= device['actual_charge_rate']
 
             dss.Text.Command(f"edit Generator.{gen_name} enabled=yes kW={build_discharge_kw}")
             self.bus_capacities[bus_name]['gen_kw'] += build_discharge_kw
-            
+
             device['mode'] = 'generator'
             device['active'] = True
             device['actual_charge_rate'] = 0
@@ -794,7 +1163,7 @@ class OpenDSSCircuit:
             device['actual_discharge_rate'] = 0
             device['actual_charge_rate'] = build_charge_kw
             message = f"Storage device '{device_name}' toggled to LOAD mode."
-        
+
         device['last_update_time'] = time.time()
         return {"status": "success", "message": message}
 
@@ -842,12 +1211,13 @@ class OpenDSSCircuit:
 
         return {"status": "success"}
 
-    def register_dfp(self, name: str, min_power_kw: float, target_pf: float):
+    def register_dfp(self, name: str, description: str, min_power_kw: float, target_pf: float):
         """Registers a new DFP. The index is determined by its position in the list."""
         dfp_index = len(self.dfps) + 1
         dfp_details = {
             "index": dfp_index,
             "name": name,
+            "description": description,
             "min_power_kw": min_power_kw,
             "target_pf": target_pf,
             "registered_at": time.strftime("%Y-%m-%d %H:%M:%S")
@@ -856,7 +1226,7 @@ class OpenDSSCircuit:
         print(f"DFP '{name}' (Index: {dfp_index}) registered successfully.")
         return dfp_details
 
-    def update_dfp(self, name: str, new_min_power_kw: float, new_target_pf: float) -> dict:
+    def update_dfp(self, name: str, new_min_power_kw: float, new_target_pf: float, new_description: str = None) -> dict:
         """NEW: Updates the parameters of an existing DFP identified by its name."""
         dfp_to_update = next((dfp for dfp in self.dfps if dfp['name'].lower() == name.lower()), None)
 
@@ -865,6 +1235,9 @@ class OpenDSSCircuit:
 
         dfp_to_update['min_power_kw'] = new_min_power_kw
         dfp_to_update['target_pf'] = new_target_pf
+        if new_description is not None:
+            dfp_to_update['description'] = new_description
+
         print(f"DFP '{name}' updated successfully.")
         return {"status": "success", "data": dfp_to_update}
 
@@ -915,7 +1288,7 @@ class OpenDSSCircuit:
 
                 load_name = f"dev_{device['device_name'].replace(' ', '_')}"
                 dss.Text.Command(f"edit Load.{load_name} kW={new_kw}")
-                
+
                 device['kw'] = new_kw
                 total_reduction_kw += reduction_amount
                 modified_count += 1
@@ -959,11 +1332,11 @@ class OpenDSSCircuit:
 
         log_summary = []
         participation_data = []
-        
+
         for bus_name in subscribed_buses:
             did_participate = random.choice([True, False])
             participation_data.append({'bus_name': bus_name, 'participated': did_participate})
-            
+
             if did_participate:
                 result = self.modify_high_wattage_devices_in_bus(bus_name, power_threshold_kw, reduction_factor)
                 log_summary.append(f"Bus '{bus_name}': {result['message']}")
@@ -972,11 +1345,54 @@ class OpenDSSCircuit:
 
         return {
             "status": "success",
+            "dfp_details": target_dfp,
             "message": f"Executed DFP '{dfp_name}' on {len(subscribed_buses)} bus(es).",
             "details": log_summary,
             "participation_data": participation_data
         }
-    
+
+    def send_dfp_to_neighbourhood(self, neighbourhood_id: int, dfp_name: str) -> dict:
+        """
+        Sends a DFP to a neighbourhood, randomly subscribing buses.
+        """
+        # 1. Validate the DFP
+        target_dfp = next((dfp for dfp in self.dfps if dfp['name'].lower() == dfp_name.lower()), None)
+        if not target_dfp:
+            return {"status": "error", "message": f"DFP with name '{dfp_name}' not found."}
+
+        # 2. Validate the neighbourhood
+        # CHANGE THE LINE BELOW
+        buses_in_neighbourhood = self.neighborhood_data.get(neighbourhood_id) # <--- CHANGE THIS
+        if not buses_in_neighbourhood:
+            return {"status": "error", "message": f"Neighbourhood with ID '{neighbourhood_id}' not found."}
+
+        # 3. Iterate and subscribe randomly
+        subscription_log = []
+        subscribed_count = 0
+        all_circuit_buses = [b.lower() for b in dss.Circuit.AllBusNames()]
+
+        for bus_name in buses_in_neighbourhood:
+            # Ensure bus exists in the simulation before trying to subscribe
+            if bus_name.lower() not in all_circuit_buses:
+                subscription_log.append({"bus_name": bus_name, "status": "not_found", "message": "Bus not in active circuit."})
+                continue
+
+            if random.choice([True, False]):
+                self.subscribe_dfp(bus_name, dfp_name)
+                subscription_log.append({"bus_name": bus_name, "status": "subscribed"})
+                subscribed_count += 1
+            else:
+                subscription_log.append({"bus_name": bus_name, "status": "not_subscribed"})
+
+        total_buses = len(buses_in_neighbourhood)
+        message = f"Sent DFP '{dfp_name}' to neighbourhood {neighbourhood_id}. Subscribed {subscribed_count} out of {total_buses} valid buses."
+
+        return {
+            "status": "success",
+            "message": message,
+            "details": subscription_log
+        }
+
     def get_power_flow_results(self) -> dict:
         """Returns key power flow results from the circuit."""
         total_p, _ = dss.Circuit.TotalPower()
@@ -995,8 +1411,85 @@ class OpenDSSCircuit:
                 max_power_kva += dss.Transformers.kVA()
                 if not dss.Transformers.Next() > 0:
                     break
-        
+
         return {
             "maximum_circuit_load_kW": max_load_kw,
             "maximum_circuit_power_kVA": max_power_kva
         }
+
+    def get_all_dfp_details(self) -> list:
+        """
+        Returns a list of all DFPs with their details, including a list of subscribed buses.
+        """
+        all_dfps_details = []
+        for dfp in self.dfps:
+            # Create a copy to avoid modifying the original DFP registry
+            dfp_details = dfp.copy()
+
+            subscribed_buses = []
+            dfp_index = dfp['index']
+
+            # Iterate through the bus_dfps dictionary to find subscribers
+            for bus_name, subscriptions in self.bus_dfps.items():
+                # Check if the subscription list is long enough and if the flag is set
+                if len(subscriptions) >= dfp_index and subscriptions[dfp_index - 1] == 1:
+                    subscribed_buses.append(bus_name)
+
+            dfp_details['subscribed_buses'] = subscribed_buses
+            all_dfps_details.append(dfp_details)
+
+        return all_dfps_details
+
+    def get_state(self) -> dict:
+        """Extracts all serializable state attributes from the circuit object."""
+        return {
+            "dss_file": self.dss_file,
+            "devices": self.devices,
+            "storage_devices": self.storage_devices,
+            "last_simulation_time": self.last_simulation_time,
+            "bus_capacities": self.bus_capacities,
+            "bus_transformers": self.bus_transformers,
+            "transformer_statuses": self.transformer_statuses,
+            "load_original_bus_map": self.load_original_bus_map,
+            "original_load_kws": self.original_load_kws,
+            "generator_states": self.generator_states,
+            "bus_dfps": self.bus_dfps,
+            "dfps": self.dfps,
+            "dfp_acceptance_status": self.dfp_acceptance_status,
+            "dynamic_commands": self.dynamic_commands
+        }
+
+    def set_state(self, state: dict):
+        """
+        Applies a saved state to the circuit object. First, it replays commands to
+        recreate dynamically added elements, then restores the Python-level state.
+        """
+        # Step 1: Restore the Python-level state. This is done first so that any
+        # subsequent logic has access to the correct state variables.
+        self.devices = state.get("devices", {})
+        self.storage_devices = state.get("storage_devices", {})
+        self.last_simulation_time = state.get("last_simulation_time", time.time())
+        self.bus_capacities = state.get("bus_capacities", {})
+        self.bus_transformers = state.get("bus_transformers", {})
+        self.transformer_statuses = state.get("transformer_statuses", {})
+        self.load_original_bus_map = state.get("load_original_bus_map", {})
+        self.original_load_kws = state.get("original_load_kws", {})
+        self.generator_states = state.get("generator_states", {})
+        self.bus_dfps = state.get("bus_dfps", {})
+        self.dfps = state.get("dfps", [])
+        self.dfp_acceptance_status = state.get("dfp_acceptance_status", {})
+
+        # Step 2: Replay commands to create dynamic circuit elements.
+        self.dynamic_commands = state.get("dynamic_commands", [])
+        if self.dynamic_commands:
+            print(f"Replaying {len(self.dynamic_commands)} dynamic commands to restore circuit topology...")
+            for cmd in self.dynamic_commands:
+                # This check prevents re-creating elements that might already exist
+                # from the base file, though in this design they should be new.
+                try:
+                    dss.Text.Command(cmd)
+                except Exception as e:
+                    print(f"Warning: Could not execute dynamic command: '{cmd}'. Error: {e}")
+            print("Dynamic elements restored.")
+
+        print("Circuit state successfully loaded from cache.")
