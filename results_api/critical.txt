@@ -1,0 +1,20 @@
+CRITICAL TRANSFORMER REPORT - 2025-07-14 12:44:09
+========================================
+
+Bus: 60
+  - Transformer: xfmr_neigh_9
+    - Loading: 92.89%
+    - Rated kVA: 300.0
+    - Current kVA: 278.68
+
+Bus: 76
+  - Transformer: xfmr_neigh_11
+    - Loading: 99.56%
+    - Rated kVA: 300.0
+    - Current kVA: 298.69
+
+Bus: 42
+  - Transformer: xfmr_neigh_8
+    - Loading: 99.44%
+    - Rated kVA: 300.0
+    - Current kVA: 298.33
